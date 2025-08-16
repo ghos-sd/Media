@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+cookies*.txt
+downloads/
+.git
+.gitignore
