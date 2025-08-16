@@ -1,16 +1,16 @@
 FROM python:3.11-slim
 
-# Install ffmpeg (مهم للفيديو والصوت)
+# ffmpeg مهم للفيديو/الصوت
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Set workdir
-WORKDIR /app
+# إعدادات بسيطة للّوجز
+ENV PYTHONUNBUFFERED=1
 
-# Copy project files
+WORKDIR /app
 COPY . .
 
-# Install Python dependencies
+# مكتبات بايثون
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Run the bot (لاحظ الاسم هنا مطابق للملف عندك)
-CMD ["python", "bot(1).py"]
+# شغّل البوت (لاحظ bot.py)
+CMD ["python", "bot.py"]
