@@ -1,16 +1,24 @@
+# استخدم صورة Python خفيفة
 FROM python:3.11-slim
 
-# ffmpeg مهم للفيديو/الصوت
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
-
-# إعدادات بسيطة للّوجز
+# إعداد متغيرات البيئة
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-WORKDIR /app
-COPY . .
+# تثبيت الحزم الأساسية
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# مكتبات بايثون
+# إنشاء مجلد للتطبيق
+WORKDIR /app
+
+# نسخ ملفات المشروع
+COPY . /app
+
+# تثبيت المتطلبات
 RUN pip install --no-cache-dir -r requirements.txt
 
-# شغّل البوت (لاحظ bot.py)
+# تشغيل البوت
 CMD ["python", "bot.py"]
