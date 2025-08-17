@@ -373,7 +373,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()            lambda: subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8", errors="ignore")
-        )
+        
         logging.info("Command succeeded. Output: %s", proc.stdout[-1200:])
         return proc.stdout
     except subprocess.CalledProcessError as e:
