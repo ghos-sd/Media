@@ -308,6 +308,234 @@ def main():
     except (subprocess.CalledProcessError, FileNotFoundError):
         logging.error("yt-dlp is not installed or not in PATH")
         sys.exit(1)
+
+    try:
+        # Check ffmpeg version and availability
+        v = subprocess.check_output(["ffmpeg", "-version"], text=True).strip()
+        logging.info("ffmpeg version: %s", v.splitlines()[0])
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logging.error("ffmpeg is not installed or not in PATH")
+        sys.exit(1)
+        
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_media_request))
+
+    logging.info("Bot is running...")
+    app.run_polling(close_loop=False)
+
+
+if __name__ == "__main__":
+    main()
+            lambda: subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8", errors="ignore")
+        )
+        logging.info("Command succeeded. Output: %s", proc.stdout[-1200:])
+        return proc.stdout
+    except subprocess.CalledProcessError as e:
+        logging.warning("Command failed with code %d. Output: %s", e.returncode, e.stdout[-1200:])
+        return None
+    except Exception as e:
+        logging.exception("Run cmd error: %s", e)
+        return None
+
+def is_valid_file(p: Path) -> bool:
+    """Checks if a Path object points to a valid file with a minimum size."""
+    try:
+        return p.is_file() and p.stat().st_size > MIN_VALID_FILE_SIZE_BYTES
+    except Exception:
+        return False
+
+# ====== DOWNLOAD & CONVERSION COMMANDS ======
+def build_yt_dlp_cmd(url: str, out_path: Path, as_audio: bool = False) -> List[str]:
+    """Constructs the yt-dlp command for a given URL."""
+    is_tiktok = "tiktok.com" in url
+    if is_tiktok:
+        cmd = [
+            "yt-dlp", "-f", "mp4*+m4a/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "--no-warnings", "--concurrent-fragments", "4",
+            "--retries", "10", "--fragment-retries", "10",
+            "--socket-timeout", "30", "--user-agent", "Mozilla/5.0",
+            "--add-header", "Referer:https://www.tiktok.com/",
+            "-o", str(out_path), url,
+        ]
+    else:
+        # YouTube / Generic
+        fmt = f"b[filesize<{MAX_FILE_SIZE_MB}M]/bv*+ba/best" if not as_audio else "bestaudio[abr<=128k]/bestaudio"
+        cmd = [
+            "yt-dlp", "-f", fmt,
+            "--no-warnings", "--restrict-filenames",
+            "--concurrent-fragments", "4",
+            "--retries", "10", "--fragment-retries", "10",
+            "--socket-timeout", "30", "--geo-bypass", "--encoding", "utf-8",
+            "--user-agent", "Mozilla/5.0",
+            "--extractor-args", "youtube:player_client=android",
+            "-o", str(out_path), url,
+        ]
+        if YOUTUBE_COOKIES_AVAILABLE:
+            cmd += ["--cookies", str(YT_COOKIE_PATH)]
+    return cmd
+
+async def reencode_to_mp4(in_path: Path, out_path: Path) -> bool:
+    """Re-encodes a video file to MP4 using ffmpeg-python."""
+    try:
+        await asyncio.to_thread(
+            lambda: ffmpeg
+            .input(str(in_path))
+            .output(str(out_path), vcodec="libx264", pix_fmt="yuv420p", preset="veryfast", movflags="+faststart", acodec="aac")
+            .run(overwrite_output=True, quiet=True)
+        )
+        return is_valid_file(out_path)
+    except ffmpeg.Error as e:
+        logging.error("FFmpeg re-encode failed: %s", e.stderr.decode('utf8', errors='ignore'))
+        return False
+    except Exception as e:
+        logging.exception("FFmpeg re-encode error: %s", e)
+        return False
+
+async def convert_to_mp3(in_path: Path, out_path: Path) -> bool:
+    """Converts a video or audio file to MP3 using ffmpeg-python."""
+    try:
+        await asyncio.to_thread(
+            lambda: ffmpeg
+            .input(str(in_path))
+            .output(str(out_path), acodec="libmp3lame", audio_bitrate="128k")
+            .run(overwrite_output=True, quiet=True)
+        )
+        return is_valid_file(out_path)
+    except ffmpeg.Error as e:
+        logging.error("FFmpeg MP3 conversion failed: %s", e.stderr.decode('utf8', errors='ignore'))
+        return False
+    except Exception as e:
+        logging.exception("FFmpeg MP3 conversion error: %s", e)
+        return False
+
+# ====== TELEGRAM HANDLERS ======
+URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
+
+def is_authorized(update: Update) -> bool:
+    """Checks if the user is authorized to use the bot."""
+    if not ALLOWED_IDS:
+        return True
+    uid = update.effective_user.id if update.effective_user else None
+    return uid in ALLOWED_IDS
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /start command."""
+    await update.message.reply_text(
+        f"أرسل رابط يوتيوب/تيك توك.\n- أكتب mp3 مع الرابط لو عايز صوت فقط.\n- الحد الأقصى: {MAX_FILE_SIZE_MB}MB."
+    )
+
+async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Main handler for processing user-submitted links."""
+    if not is_authorized(update):
+        await update.message.reply_text("غير مسموح.")
+        return
+
+    text = (update.effective_message.text or "").strip()
+    m = URL_RE.search(text)
+    if not m:
+        await update.message.reply_text("أرسل رابط صالح.")
+        return
+
+    url = m.group(1)
+    is_tiktok = "tiktok.com" in url or "vt.tiktok.com" in url
+    as_audio = "mp3" in text.lower()
+
+    # Use TemporaryDirectory for automatic cleanup
+    with TemporaryDirectory(prefix="tg_dl_", dir="/tmp") as tmp:
+        temp_dir = Path(tmp)
+        # Use a hash to shorten and unique-ify the filename
+        base_filename = f"media_{hashlib.md5(url.encode()).hexdigest()[:10]}_{update.effective_message.id}"
+        
+        # Use a clear output path template
+        output_template = temp_dir / (base_filename + (".%(ext)s" if not is_tiktok else ".mp4"))
+        
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        status_message = await update.message.reply_text("⏳ جاري التنزيل...")
+
+        try:
+            cmd = build_yt_dlp_cmd(url, output_template, as_audio)
+            
+            # Using asyncio.to_thread for blocking subprocess
+            result_output = await run_blocking_cmd(cmd)
+
+            if result_output is None:
+                await status_message.edit_text(
+                    "فشل التنزيل. قد يكون الرابط خاص أو غير متوفر.\n"
+                    "حاول مجددًا أو جرب رابطًا آخر."
+                )
+                return
+
+            downloaded_files = sorted(temp_dir.glob(f"{base_filename}*"), 
+                                      key=lambda p: p.stat().st_mtime, 
+                                      reverse=True)
+            final_file: Optional[Path] = next((f for f in downloaded_files if is_valid_file(f)), None)
+
+            if not final_file:
+                await status_message.edit_text("فشل التنزيل. الملف الناتج غير صالح.")
+                return
+
+            # Post-processing and conversion logic
+            processed_file = final_file
+            
+            if is_tiktok and FORCE_REENCODE_TT:
+                fixed_path = temp_dir / f"{base_filename}_fixed.mp4"
+                if await reencode_to_mp4(final_file, fixed_path):
+                    processed_file = fixed_path
+
+            if not is_tiktok and as_audio and processed_file.suffix.lower() not in (".mp3", ".m4a"):
+                mp3_path = temp_dir / f"{base_filename}.mp3"
+                if await convert_to_mp3(processed_file, mp3_path):
+                    processed_file = mp3_path
+            
+            # Final Telegram upload
+            try:
+                size_mb = processed_file.stat().st_size / (1024 * 1024)
+                caption = f"تم ✅ الحجم: {size_mb:.1f}MB"
+                
+                if processed_file.suffix.lower() in (".mp3", ".m4a", ".aac", ".ogg"):
+                    await update.message.reply_audio(
+                        audio=processed_file.open("rb"),
+                        caption=caption,
+                        filename=processed_file.name,
+                        read_timeout=TIMEOUT_SECONDS,
+                        write_timeout=TIMEOUT_SECONDS
+                    )
+                else:
+                    await update.message.reply_video(
+                        video=processed_file.open("rb"),
+                        caption=caption,
+                        filename=processed_file.name,
+                        read_timeout=TIMEOUT_SECONDS,
+                        write_timeout=TIMEOUT_SECONDS
+                    )
+                    
+                await status_message.delete()
+                
+            except Exception:
+                logging.exception("Failed to send file to Telegram.")
+                await status_message.edit_text("حدث خطأ أثناء إرسال الملف.")
+                
+        except Exception as e:
+            logging.exception("An unexpected error occurred: %s", e)
+            await status_message.edit_text("حصل خطأ غير متوقع.")
+        # The temporary directory and its contents are automatically cleaned up here
+
+def main():
+    """Main function to start the bot."""
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN environment variable is missing!")
+        raise SystemExit("BOT_TOKEN is missing!")
+
+    try:
+        # Check yt-dlp version and availability
+        v = subprocess.check_output(["yt-dlp", "--version"], text=True).strip()
+        logging.info("yt-dlp version: %s", v)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logging.error("yt-dlp is not installed or not in PATH")
+        sys.exit(1)
         
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
