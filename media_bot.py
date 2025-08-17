@@ -1,5 +1,6 @@
 # media_bot.py
-# Telegram bot to download media from YouTube / TikTok with yt-dlp + ffmpeg.
+# Telegram bot to download YouTube/TikTok media with yt-dlp + ffmpeg
+# Author: you :)
 
 import os
 import re
@@ -10,70 +11,55 @@ import asyncio
 import logging
 import hashlib
 import subprocess
+from functools import partial
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from typing import List, Set, Optional, Dict
 
-import ffmpeg  # ffmpeg-python (يُثبَّت عبر requirements.txt)
+import ffmpeg  # ffmpeg-python
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# =========================
-# Global configuration
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+# ========= Logging =========
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
+# ========= Env & Config =========
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 ALLOWED_IDS_RAW: str = os.getenv("ALLOWED_IDS", "").strip()
 
 CONFIG_FILE = Path("config.json")
 DEFAULT_CONFIG: Dict[str, object] = {
-    "MAX_FILE_SIZE_MB": 70,                 # حد الحجم النهائي
+    "MAX_FILE_SIZE_MB": 70,                # Telegram limit (<= 70MB)
     "MIN_VALID_FILE_SIZE_BYTES": 200 * 1024,
-    "FORCE_REENCODE_TT": True,              # إعادة ترميز تيك توك لضمان التشغيل
+    "FORCE_REENCODE_TT": True,             # Re-encode TikTok to h264/aac for compatibility
     "YT_COOKIE_PATH": "/app/cookies_youtube.txt",
     "YT_COOKIES_B64": "",
-    "TIMEOUT_SECONDS": 120                  # مهلة رفع الملف لتلغرام
+    "TIMEOUT_SECONDS": 120                 # Telegram send timeouts
 }
 
-
 def load_config() -> Dict[str, object]:
-    """Load config from config.json then override with env vars."""
     cfg = DEFAULT_CONFIG.copy()
-
     if CONFIG_FILE.is_file():
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    cfg.update(data)
+            cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
         except Exception:
-            logging.exception("Failed to read config.json, using defaults.")
-
-    # Override with environment variables if present
-    for key, val in list(cfg.items()):
-        env = os.getenv(key)
-        if env is None:
+            logging.warning("Could not read config.json, using defaults.")
+    # Override by env if present
+    for k, v in list(cfg.items()):
+        ev = os.getenv(k)
+        if ev is None:
             continue
-        if isinstance(val, bool):
-            cfg[key] = env.lower() in ("1", "true", "yes", "on")
-        elif isinstance(val, int):
+        if isinstance(v, bool):
+            cfg[k] = ev.lower() in ("1", "true", "yes", "on")
+        elif isinstance(v, int):
             try:
-                cfg[key] = int(env)
+                cfg[k] = int(ev)
             except ValueError:
-                logging.warning("Invalid int for %s: %s", key, env)
+                logging.warning("Invalid int for %s: %s", k, ev)
         else:
-            cfg[key] = env
-
+            cfg[k] = ev
     return cfg
-
 
 CONFIG = load_config()
 MAX_FILE_SIZE_MB: int = int(CONFIG["MAX_FILE_SIZE_MB"])
@@ -83,24 +69,265 @@ YT_COOKIE_PATH: Path = Path(str(CONFIG["YT_COOKIE_PATH"]))
 YT_COOKIES_B64: str = str(CONFIG["YT_COOKIES_B64"])
 TIMEOUT_SECONDS: int = int(CONFIG["TIMEOUT_SECONDS"])
 
-
 def parse_allowed_ids(s: str) -> Set[int]:
     if not s:
         return set()
     return {int(p) for p in re.split(r"[,\s]+", s) if p.strip().isdigit()}
 
-
 ALLOWED_IDS: Set[int] = parse_allowed_ids(ALLOWED_IDS_RAW)
 
-# =========================
-# Cookies (YouTube)
-# =========================
+# ========= YouTube cookies =========
 def write_youtube_cookies_file() -> bool:
-    """Decode base64 cookies and write to YT_COOKIE_PATH."""
     if not YT_COOKIES_B64:
-        logging.warning("YT_COOKIES_B64 is empty – YouTube may require login.")
+        logging.warning("YT_COOKIES_B64 empty; YouTube may require login.")
         return False
     try:
+        data = base64.b64decode(YT_COOKIES_B64)
+        YT_COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        YT_COOKIE_PATH.write_bytes(data)
+        ok = YT_COOKIE_PATH.exists() and YT_COOKIE_PATH.stat().st_size > 200
+        logging.info("Wrote cookies to %s (size=%d)", YT_COOKIE_PATH, YT_COOKIE_PATH.stat().st_size if ok else 0)
+        return ok
+    except Exception as e:
+        logging.exception("Failed writing cookies: %s", e)
+        return False
+
+YOUTUBE_COOKIES_AVAILABLE: bool = write_youtube_cookies_file()
+
+# ========= Helpers =========
+async def run_blocking_cmd(cmd: List[str]) -> Optional[str]:
+    """
+    Run a blocking subprocess in a thread so we don't block the asyncio loop.
+    Returns stdout text on success, None on failure.
+    """
+    logging.info("RUN: %s", " ".join(cmd))
+    loop = asyncio.get_event_loop()
+    try:
+        call = partial(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        proc = await loop.run_in_executor(None, call)
+        logging.info("OK: %s", (proc.stdout or "")[-1200:])
+        return proc.stdout
+    except subprocess.CalledProcessError as e:
+        logging.warning("FAIL rc=%s: %s", e.returncode, (e.stdout or "")[-1200:])
+        return None
+    except Exception as e:
+        logging.exception("run_blocking_cmd error: %s", e)
+        return None
+
+def is_valid_file(p: Path) -> bool:
+    try:
+        return p.is_file() and p.stat().st_size > MIN_VALID_FILE_SIZE_BYTES
+    except Exception:
+        return False
+
+# ========= yt-dlp commands =========
+def build_yt_dlp_cmd(url: str, out_path: Path, as_audio: bool = False) -> List[str]:
+    is_tiktok = ("tiktok.com" in url) or ("vt.tiktok.com" in url)
+    if is_tiktok:
+        return [
+            "yt-dlp",
+            "-f", "mp4*+m4a/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "--no-warnings",
+            "--concurrent-fragments", "4",
+            "--retries", "10",
+            "--fragment-retries", "10",
+            "--socket-timeout", "30",
+            "--user-agent", "Mozilla/5.0",
+            "--add-header", "Referer:https://www.tiktok.com/",
+            "-o", str(out_path),
+            url,
+        ]
+    # YouTube / others
+    fmt = f"b[filesize<{MAX_FILE_SIZE_MB}M]/bv*+ba/best" if not as_audio else "bestaudio[abr<=128k]/bestaudio"
+    cmd = [
+        "yt-dlp",
+        "-f", fmt,
+        "--no-warnings",
+        "--restrict-filenames",
+        "--concurrent-fragments", "4",
+        "--retries", "10",
+        "--fragment-retries", "10",
+        "--socket-timeout", "30",
+        "--geo-bypass",
+        "--encoding", "utf-8",
+        "--user-agent", "Mozilla/5.0",
+        "--extractor-args", "youtube:player_client=android",
+        "-o", str(out_path),
+        url,
+    ]
+    if YOUTUBE_COOKIES_AVAILABLE:
+        cmd += ["--cookies", str(YT_COOKIE_PATH)]
+    return cmd
+
+async def reencode_to_mp4(in_path: Path, out_path: Path) -> bool:
+    try:
+        await asyncio.to_thread(
+            lambda: ffmpeg
+            .input(str(in_path))
+            .output(str(out_path),
+                    vcodec="libx264",
+                    pix_fmt="yuv420p",
+                    preset="veryfast",
+                    movflags="+faststart",
+                    acodec="aac")
+            .run(overwrite_output=True, quiet=True)
+        )
+        return is_valid_file(out_path)
+    except ffmpeg.Error as e:
+        try:
+            err = e.stderr.decode("utf-8", errors="ignore")
+        except Exception:
+            err = str(e)
+        logging.error("ffmpeg re-encode failed: %s", err)
+        return False
+    except Exception as e:
+        logging.exception("ffmpeg error: %s", e)
+        return False
+
+async def convert_to_mp3(in_path: Path, out_path: Path) -> bool:
+    try:
+        await asyncio.to_thread(
+            lambda: ffmpeg
+            .input(str(in_path))
+            .output(str(out_path), acodec="libmp3lame", audio_bitrate="128k")
+            .run(overwrite_output=True, quiet=True)
+        )
+        return is_valid_file(out_path)
+    except ffmpeg.Error as e:
+        try:
+            err = e.stderr.decode("utf-8", errors="ignore")
+        except Exception:
+            err = str(e)
+        logging.error("ffmpeg mp3 failed: %s", err)
+        return False
+    except Exception as e:
+        logging.exception("ffmpeg mp3 error: %s", e)
+        return False
+
+# ========= Telegram =========
+URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
+
+def is_authorized(update: Update) -> bool:
+    if not ALLOWED_IDS:
+        return True
+    uid = update.effective_user.id if update.effective_user else None
+    return uid in ALLOWED_IDS
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"أرسل رابط يوتيوب / تيك توك.\n"
+        f"- اكتب mp3 مع الرابط لو عايز صوت فقط.\n"
+        f"- الحد الأقصى: {MAX_FILE_SIZE_MB}MB."
+    )
+
+async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("غير مسموح.")
+        return
+
+    text = (update.effective_message.text or "").strip()
+    m = URL_RE.search(text)
+    if not m:
+        await update.message.reply_text("أرسل رابط صالح.")
+        return
+
+    url = m.group(1)
+    is_tiktok = ("tiktok.com" in url) or ("vt.tiktok.com" in url)
+    as_audio = "mp3" in text.lower()
+
+    with TemporaryDirectory(prefix="tg_dl_", dir="/tmp") as tmp:
+        tmpdir = Path(tmp)
+        base = f"media_{hashlib.md5(url.encode()).hexdigest()[:10]}_{update.effective_message.id}"
+        out_tmpl = tmpdir / (base + (".mp4" if is_tiktok else ".%(ext)s"))
+
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        status = await update.message.reply_text("⏳ جاري التنزيل...")
+
+        try:
+            cmd = build_yt_dlp_cmd(url, out_tmpl, as_audio)
+            result = await run_blocking_cmd(cmd)
+            if result is None:
+                await status.edit_text("فشل التنزيل. ربما الرابط خاص أو غير متاح. جرّب رابط آخر.")
+                return
+
+            files = sorted(tmpdir.glob(f"{base}*"), key=lambda p: p.stat().st_mtime, reverse=True)
+            final_file: Optional[Path] = next((p for p in files if is_valid_file(p)), None)
+            if not final_file:
+                await status.edit_text("فشل التنزيل. الملف الناتج غير صالح.")
+                return
+
+            processed = final_file
+            if is_tiktok and FORCE_REENCODE_TT:
+                fixed = tmpdir / f"{base}_fixed.mp4"
+                if await reencode_to_mp4(final_file, fixed):
+                    processed = fixed
+
+            if (not is_tiktok) and as_audio and processed.suffix.lower() not in (".mp3", ".m4a"):
+                mp3 = tmpdir / f"{base}.mp3"
+                if await convert_to_mp3(processed, mp3):
+                    processed = mp3
+
+            try:
+                size_mb = processed.stat().st_size / (1024 * 1024)
+                caption = f"تم ✅ الحجم: {size_mb:.1f}MB"
+
+                if processed.suffix.lower() in (".mp3", ".m4a", ".aac", ".ogg"):
+                    await update.message.reply_audio(
+                        audio=processed.open("rb"),
+                        caption=caption,
+                        filename=processed.name,
+                        read_timeout=TIMEOUT_SECONDS,
+                        write_timeout=TIMEOUT_SECONDS,
+                    )
+                else:
+                    await update.message.reply_video(
+                        video=processed.open("rb"),
+                        caption=caption,
+                        filename=processed.name,
+                        read_timeout=TIMEOUT_SECONDS,
+                        write_timeout=TIMEOUT_SECONDS,
+                    )
+                await status.delete()
+            except Exception:
+                logging.exception("Telegram send failed")
+                await status.edit_text("حدث خطأ أثناء إرسال الملف.")
+
+        except Exception as e:
+            logging.exception("Unexpected error: %s", e)
+            await status.edit_text("حصل خطأ غير متوقع. جرّب لاحقًا.")
+
+# ========= Main =========
+def main() -> None:
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN is missing!")
+        raise SystemExit("BOT_TOKEN is missing!")
+
+    # Ensure yt-dlp present
+    try:
+        v = subprocess.check_output(["yt-dlp", "--version"], text=True).strip()
+        logging.info("yt-dlp version: %s", v)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logging.error("yt-dlp is not installed or not in PATH")
+        sys.exit(1)
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_media_request))
+
+    logging.info("Bot is running…")
+    app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()    try:
         data = base64.b64decode(YT_COOKIES_B64)
         YT_COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
         YT_COOKIE_PATH.write_bytes(data)
